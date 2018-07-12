@@ -3,7 +3,7 @@
 //  ---------------------------------------------------------------------------
 
 const Exchange = require ('./base/Exchange');
-const { ExchangeError } = require ('./base/errors');
+const { ExchangeError, InvalidNonce, AuthenticationError, OrderNotFound } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -12,11 +12,13 @@ module.exports = class bitso extends Exchange {
         return this.deepExtend (super.describe (), {
             'id': 'bitso',
             'name': 'Bitso',
-            'countries': 'MX', // Mexico
+            'countries': [ 'MX' ], // Mexico
             'rateLimit': 2000, // 30 requests per minute
             'version': 'v3',
             'has': {
                 'CORS': true,
+                'fetchMyTrades': true,
+                'fetchOpenOrders': true,
             },
             'urls': {
                 'logo': 'https://user-images.githubusercontent.com/1294454/27766335-715ce7aa-5ed5-11e7-88a8-173a27bb30fe.jpg',
@@ -61,17 +63,27 @@ module.exports = class bitso extends Exchange {
                         'bitcoin_withdrawal',
                         'debit_card_withdrawal',
                         'ether_withdrawal',
+                        'ripple_withdrawal',
+                        'bcash_withdrawal',
+                        'litecoin_withdrawal',
                         'orders',
                         'phone_number',
                         'phone_verification',
                         'phone_withdrawal',
                         'spei_withdrawal',
+                        'ripple_withdrawal',
+                        'bcash_withdrawal',
+                        'litecoin_withdrawal',
                     ],
                     'delete': [
                         'orders/{oid}',
                         'orders/all',
                     ],
                 },
+            },
+            'exceptions': {
+                '0201': AuthenticationError, // Invalid Nonce or Invalid Credentials
+                '104': InvalidNonce, // Cannot perform request - nonce must be higher than 1520307203724237
             },
         });
     }
@@ -86,16 +98,16 @@ module.exports = class bitso extends Exchange {
             let [ base, quote ] = symbol.split ('/');
             let limits = {
                 'amount': {
-                    'min': parseFloat (market['minimum_amount']),
-                    'max': parseFloat (market['maximum_amount']),
+                    'min': this.safeFloat (market, 'minimum_amount'),
+                    'max': this.safeFloat (market, 'maximum_amount'),
                 },
                 'price': {
-                    'min': parseFloat (market['minimum_price']),
-                    'max': parseFloat (market['maximum_price']),
+                    'min': this.safeFloat (market, 'minimum_price'),
+                    'max': this.safeFloat (market, 'maximum_price'),
                 },
                 'cost': {
-                    'min': parseFloat (market['minimum_value']),
-                    'max': parseFloat (market['maximum_value']),
+                    'min': this.safeFloat (market, 'minimum_value'),
+                    'max': this.safeFloat (market, 'maximum_value'),
                 },
             };
             let precision = {
@@ -152,22 +164,25 @@ module.exports = class bitso extends Exchange {
         }, params));
         let ticker = response['payload'];
         let timestamp = this.parse8601 (ticker['created_at']);
-        let vwap = parseFloat (ticker['vwap']);
-        let baseVolume = parseFloat (ticker['volume']);
+        let vwap = this.safeFloat (ticker, 'vwap');
+        let baseVolume = this.safeFloat (ticker, 'volume');
         let quoteVolume = baseVolume * vwap;
+        let last = this.safeFloat (ticker, 'last');
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
-            'high': parseFloat (ticker['high']),
-            'low': parseFloat (ticker['low']),
-            'bid': parseFloat (ticker['bid']),
-            'ask': parseFloat (ticker['ask']),
+            'high': this.safeFloat (ticker, 'high'),
+            'low': this.safeFloat (ticker, 'low'),
+            'bid': this.safeFloat (ticker, 'bid'),
+            'bidVolume': undefined,
+            'ask': this.safeFloat (ticker, 'ask'),
+            'askVolume': undefined,
             'vwap': vwap,
             'open': undefined,
-            'close': undefined,
-            'first': undefined,
-            'last': parseFloat (ticker['last']),
+            'close': last,
+            'last': last,
+            'previousClose': undefined,
             'change': undefined,
             'percentage': undefined,
             'average': undefined,
@@ -289,9 +304,10 @@ module.exports = class bitso extends Exchange {
     parseOrderStatus (status) {
         let statuses = {
             'partial-fill': 'open', // this is a common substitution in ccxt
+            'completed': 'closed',
         };
         if (status in statuses)
-            return statuses['status'];
+            return statuses[status];
         return status;
     }
 
@@ -308,14 +324,15 @@ module.exports = class bitso extends Exchange {
             symbol = market['symbol'];
         let orderType = order['type'];
         let timestamp = this.parse8601 (order['created_at']);
-        let amount = parseFloat (order['original_amount']);
-        let remaining = parseFloat (order['unfilled_amount']);
+        let amount = this.safeFloat (order, 'original_amount');
+        let remaining = this.safeFloat (order, 'unfilled_amount');
         let filled = amount - remaining;
         let result = {
             'info': order,
             'id': order['oid'],
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
+            'lastTradeTimestamp': undefined,
             'symbol': symbol,
             'type': orderType,
             'side': side,
@@ -357,6 +374,78 @@ module.exports = class bitso extends Exchange {
         return orders;
     }
 
+    async fetchOrder (id, symbol = undefined, params = {}) {
+        await this.loadMarkets ();
+        let market = this.market (symbol);
+        let response = await this.privateGetOrdersOid ({
+            'oid': id,
+        });
+        let numOrders = response['payload'].length;
+        if (!Array.isArray (response['payload']) || (numOrders !== 1)) {
+            throw new OrderNotFound (this.id + ': The order ' + id + ' not found.');
+        }
+        return this.parseOrder (response['payload'][0], market);
+    }
+
+    async fetchOrderTrades (id, symbol = undefined, params = {}) {
+        await this.loadMarkets ();
+        let market = this.market (symbol);
+        let response = await this.privateGetOrderTradesOid ({
+            'oid': id,
+        });
+        return this.parseTrades (response['payload'], market);
+    }
+
+    async fetchDepositAddress (code, params = {}) {
+        await this.loadMarkets ();
+        let currency = this.currency (code);
+        let request = {
+            'fund_currency': currency['id'],
+        };
+        let response = await this.privateGetFundingDestination (this.extend (request, params));
+        let address = this.safeString (response['payload'], 'account_identifier');
+        let tag = undefined;
+        if (code === 'XRP') {
+            let parts = address.split ('?dt=');
+            address = parts[0];
+            tag = parts[1];
+        }
+        this.checkAddress (address);
+        return {
+            'currency': code,
+            'address': address,
+            'tag': tag,
+            'info': response,
+        };
+    }
+
+    async withdraw (code, amount, address, tag = undefined, params = {}) {
+        this.checkAddress (address);
+        await this.loadMarkets ();
+        let methods = {
+            'BTC': 'Bitcoin',
+            'ETH': 'Ether',
+            'XRP': 'Ripple',
+            'BCH': 'Bcash',
+            'LTC': 'Litecoin',
+        };
+        let method = (code in methods) ? methods[code] : undefined;
+        if (typeof method === 'undefined') {
+            throw new ExchangeError (this.id + ' not valid withdraw coin: ' + code);
+        }
+        let request = {
+            'amount': amount,
+            'address': address,
+            'destination_tag': tag,
+        };
+        let classMethod = 'privatePost' + method + 'Withdrawal';
+        let response = await this[classMethod] (this.extend (request, params));
+        return {
+            'info': response,
+            'id': this.safeString (response['payload'], 'wid'),
+        };
+    }
+
     sign (path, api = 'public', method = 'GET', params = {}, headers = undefined, body = undefined) {
         let endpoint = '/' + this.version + '/' + this.implodeParams (path, params);
         let query = this.omit (params, this.extractParams (path));
@@ -383,6 +472,41 @@ module.exports = class bitso extends Exchange {
             };
         }
         return { 'url': url, 'method': method, 'body': body, 'headers': headers };
+    }
+
+    handleErrors (httpCode, reason, url, method, headers, body) {
+        if (typeof body !== 'string')
+            return; // fallback to default error handler
+        if (body.length < 2)
+            return; // fallback to default error handler
+        if ((body[0] === '{') || (body[0] === '[')) {
+            let response = JSON.parse (body);
+            if ('success' in response) {
+                //
+                //     {"success":false,"error":{"code":104,"message":"Cannot perform request - nonce must be higher than 1520307203724237"}}
+                //
+                let success = this.safeValue (response, 'success', false);
+                if (typeof success === 'string') {
+                    if ((success === 'true') || (success === '1'))
+                        success = true;
+                    else
+                        success = false;
+                }
+                if (!success) {
+                    const feedback = this.id + ' ' + this.json (response);
+                    const error = this.safeValue (response, 'error');
+                    if (typeof error === 'undefined')
+                        throw new ExchangeError (feedback);
+                    const code = this.safeString (error, 'code');
+                    const exceptions = this.exceptions;
+                    if (code in exceptions) {
+                        throw new exceptions[code] (feedback);
+                    } else {
+                        throw new ExchangeError (feedback);
+                    }
+                }
+            }
+        }
     }
 
     async request (path, api = 'public', method = 'GET', params = {}, headers = undefined, body = undefined) {

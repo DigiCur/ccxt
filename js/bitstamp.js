@@ -3,7 +3,7 @@
 //  ---------------------------------------------------------------------------
 
 const Exchange = require ('./base/Exchange');
-const { AuthenticationError, ExchangeError, NotSupported } = require ('./base/errors');
+const { AuthenticationError, ExchangeError, NotSupported, PermissionDenied } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -12,7 +12,7 @@ module.exports = class bitstamp extends Exchange {
         return this.deepExtend (super.describe (), {
             'id': 'bitstamp',
             'name': 'Bitstamp',
-            'countries': 'GB',
+            'countries': [ 'GB' ],
             'rateLimit': 1000,
             'version': 'v2',
             'has': {
@@ -68,6 +68,7 @@ module.exports = class bitstamp extends Exchange {
                         'xrp_address/',
                         'transfer-to-main/',
                         'transfer-from-main/',
+                        'withdrawal-requests/',
                         'withdrawal/open/',
                         'withdrawal/status/',
                         'withdrawal/cancel/',
@@ -141,6 +142,9 @@ module.exports = class bitstamp extends Exchange {
                     },
                 },
             },
+            'exceptions': {
+                'No permission found': PermissionDenied,
+            },
         });
     }
 
@@ -210,22 +214,25 @@ module.exports = class bitstamp extends Exchange {
             'pair': this.marketId (symbol),
         }, params));
         let timestamp = parseInt (ticker['timestamp']) * 1000;
-        let vwap = parseFloat (ticker['vwap']);
-        let baseVolume = parseFloat (ticker['volume']);
+        let vwap = this.safeFloat (ticker, 'vwap');
+        let baseVolume = this.safeFloat (ticker, 'volume');
         let quoteVolume = baseVolume * vwap;
+        let last = this.safeFloat (ticker, 'last');
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
-            'high': parseFloat (ticker['high']),
-            'low': parseFloat (ticker['low']),
-            'bid': parseFloat (ticker['bid']),
-            'ask': parseFloat (ticker['ask']),
+            'high': this.safeFloat (ticker, 'high'),
+            'low': this.safeFloat (ticker, 'low'),
+            'bid': this.safeFloat (ticker, 'bid'),
+            'bidVolume': undefined,
+            'ask': this.safeFloat (ticker, 'ask'),
+            'askVolume': undefined,
             'vwap': vwap,
-            'open': parseFloat (ticker['open']),
-            'close': undefined,
-            'first': undefined,
-            'last': parseFloat (ticker['last']),
+            'open': this.safeFloat (ticker, 'open'),
+            'close': last,
+            'last': last,
+            'previousClose': undefined,
             'change': undefined,
             'percentage': undefined,
             'average': undefined,
@@ -243,9 +250,12 @@ module.exports = class bitstamp extends Exchange {
             'tid',
             'type',
             'order_id',
+            'side',
         ]);
         let currencyIds = Object.keys (trade);
         let numCurrencyIds = currencyIds.length;
+        if (numCurrencyIds > 2)
+            throw new ExchangeError (this.id + ' getMarketFromTrade too many keys: ' + this.json (currencyIds) + ' in the trade: ' + this.json (trade));
         if (numCurrencyIds === 2) {
             let marketId = currencyIds[0] + currencyIds[1];
             if (marketId in this.markets_by_id)
@@ -339,7 +349,7 @@ module.exports = class bitstamp extends Exchange {
         let market = this.market (symbol);
         let response = await this.publicGetTransactionsPair (this.extend ({
             'pair': market['id'],
-            'time': 'minute',
+            'time': 'hour',
         }, params));
         return this.parseTrades (response, market, since, limit);
     }
@@ -372,12 +382,12 @@ module.exports = class bitstamp extends Exchange {
         let method = 'privatePost' + this.capitalize (side);
         let order = {
             'pair': this.marketId (symbol),
-            'amount': amount,
+            'amount': this.amountToPrecision (symbol, amount),
         };
         if (type === 'market')
             method += 'Market';
         else
-            order['price'] = price;
+            order['price'] = this.priceToPrecision (symbol, price);
         method += 'Pair';
         let response = await this[method] (this.extend (order, params));
         return {
@@ -424,6 +434,8 @@ module.exports = class bitstamp extends Exchange {
             request['pair'] = market['id'];
             method += 'Pair';
         }
+        if (typeof limit !== 'undefined')
+            request['limit'] = limit;
         let response = await this[method] (this.extend (request, params));
         return this.parseTrades (response, market, since, limit);
     }
@@ -506,6 +518,7 @@ module.exports = class bitstamp extends Exchange {
             'id': id,
             'datetime': iso8601,
             'timestamp': timestamp,
+            'lastTradeTimestamp': undefined,
             'status': status,
             'symbol': symbol,
             'type': undefined,
@@ -523,8 +536,8 @@ module.exports = class bitstamp extends Exchange {
 
     async fetchOpenOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
         let market = undefined;
+        await this.loadMarkets ();
         if (typeof symbol !== 'undefined') {
-            await this.loadMarkets ();
             market = this.market (symbol);
         }
         let orders = await this.privatePostOpenOrdersAll ();
@@ -555,16 +568,19 @@ module.exports = class bitstamp extends Exchange {
         method += v1 ? 'Deposit' : '';
         method += 'Address';
         let response = await this[method] (params);
+        let address = v1 ? response : this.safeString (response, 'address');
+        let tag = v1 ? undefined : this.safeString (response, 'destination_tag');
+        this.checkAddress (address);
         return {
             'currency': code,
-            'status': 'ok',
-            'address': this.safeString (response, 'address'),
-            'tag': this.safeString (response, 'destination_tag'),
+            'address': address,
+            'tag': tag,
             'info': response,
         };
     }
 
     async withdraw (code, amount, address, tag = undefined, params = {}) {
+        this.checkAddress (address);
         if (this.isFiat (code))
             throw new NotSupported (this.id + ' fiat withdraw() for ' + code + ' is not implemented yet');
         let name = this.getCurrencyName (code);
@@ -625,6 +641,12 @@ module.exports = class bitstamp extends Exchange {
             return; // fallback to default error handler
         if ((body[0] === '{') || (body[0] === '[')) {
             let response = JSON.parse (body);
+            // fetchDepositAddress returns {"error": "No permission found"} on apiKeys that don't have the permission required
+            let error = this.safeString (response, 'error');
+            let exceptions = this.exceptions;
+            if (error in exceptions) {
+                throw new exceptions[error] (this.id + ' ' + body);
+            }
             let status = this.safeString (response, 'status');
             if (status === 'error') {
                 let code = this.safeString (response, 'code');
@@ -632,7 +654,7 @@ module.exports = class bitstamp extends Exchange {
                     if (code === 'API0005')
                         throw new AuthenticationError (this.id + ' invalid signature, use the uid for the main account if you have subaccounts');
                 }
-                throw new ExchangeError (this.id + ' ' + this.json (response));
+                throw new ExchangeError (this.id + ' ' + body);
             }
         }
     }

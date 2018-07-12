@@ -8,9 +8,9 @@ import base64
 import hashlib
 import json
 from ccxt.base.errors import ExchangeError
-from ccxt.base.errors import NotSupported
 from ccxt.base.errors import InvalidOrder
 from ccxt.base.errors import OrderNotFound
+from ccxt.base.errors import NotSupported
 from ccxt.base.errors import DDoSProtection
 
 
@@ -20,7 +20,7 @@ class btcmarkets (Exchange):
         return self.deep_extend(super(btcmarkets, self).describe(), {
             'id': 'btcmarkets',
             'name': 'BTC Markets',
-            'countries': 'AU',  # Australia
+            'countries': ['AU'],  # Australia
             'rateLimit': 1000,  # market data cached for 1 second(trades cached for 2 seconds)
             'has': {
                 'CORS': False,
@@ -30,6 +30,7 @@ class btcmarkets (Exchange):
                 'fetchClosedOrders': 'emulated',
                 'fetchOpenOrders': True,
                 'fetchMyTrades': True,
+                'cancelOrders': True,
             },
             'urls': {
                 'logo': 'https://user-images.githubusercontent.com/1294454/29142911-0e1acfc2-7d5c-11e7-98c4-07d9532b29d7.jpg',
@@ -152,23 +153,26 @@ class btcmarkets (Exchange):
         symbol = None
         if market:
             symbol = market['symbol']
+        last = self.safe_float(ticker, 'lastPrice')
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
             'high': None,
             'low': None,
-            'bid': float(ticker['bestBid']),
-            'ask': float(ticker['bestAsk']),
+            'bid': self.safe_float(ticker, 'bestBid'),
+            'bidVolume': None,
+            'ask': self.safe_float(ticker, 'bestAsk'),
+            'askVolume': None,
             'vwap': None,
             'open': None,
-            'close': None,
-            'first': None,
-            'last': float(ticker['lastPrice']),
+            'close': last,
+            'last': last,
+            'previousClose': None,
             'change': None,
             'percentage': None,
             'average': None,
-            'baseVolume': float(ticker['volume24h']),
+            'baseVolume': self.safe_float(ticker, 'volume24h'),
             'quoteVolume': None,
             'info': ticker,
         }
@@ -271,7 +275,7 @@ class btcmarkets (Exchange):
         side = 'buy' if (order['orderSide'] == 'Bid') else 'sell'
         type = 'limit' if (order['ordertype'] == 'Limit') else 'market'
         timestamp = order['creationTime']
-        if not market:
+        if market is None:
             market = self.market(order['instrument'] + '/' + order['currency'])
         status = 'open'
         if order['status'] == 'Failed' or order['status'] == 'Cancelled' or order['status'] == 'Partially Cancelled' or order['status'] == 'Error':
@@ -289,6 +293,7 @@ class btcmarkets (Exchange):
             'id': str(order['id']),
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
+            'lastTradeTimestamp': None,
             'symbol': market['symbol'],
             'type': type,
             'side': side,
@@ -331,7 +336,7 @@ class btcmarkets (Exchange):
         return request
 
     def fetch_orders(self, symbol=None, since=None, limit=None, params={}):
-        if not symbol:
+        if symbol is None:
             raise NotSupported(self.id + ': fetchOrders requires a `symbol` parameter.')
         self.load_markets()
         market = self.market(symbol)
@@ -340,7 +345,7 @@ class btcmarkets (Exchange):
         return self.parse_orders(response['orders'], market)
 
     def fetch_open_orders(self, symbol=None, since=None, limit=None, params={}):
-        if not symbol:
+        if symbol is None:
             raise NotSupported(self.id + ': fetchOpenOrders requires a `symbol` parameter.')
         self.load_markets()
         market = self.market(symbol)
@@ -353,7 +358,7 @@ class btcmarkets (Exchange):
         return self.filter_by(orders, 'status', 'closed')
 
     def fetch_my_trades(self, symbol=None, since=None, limit=None, params={}):
-        if not symbol:
+        if symbol is None:
             raise NotSupported(self.id + ': fetchMyTrades requires a `symbol` parameter.')
         self.load_markets()
         market = self.market(symbol)

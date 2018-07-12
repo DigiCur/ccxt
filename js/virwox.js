@@ -163,25 +163,27 @@ module.exports = class virwox extends Exchange {
         let lastKey = keys[length - 1];
         let ticker = tickers[lastKey];
         let timestamp = this.milliseconds ();
-        let close = parseFloat (ticker['close']);
+        let close = this.safeFloat (ticker, 'close');
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
-            'high': parseFloat (ticker['high']),
-            'low': parseFloat (ticker['low']),
+            'high': this.safeFloat (ticker, 'high'),
+            'low': this.safeFloat (ticker, 'low'),
             'bid': undefined,
+            'bidVolume': undefined,
             'ask': undefined,
+            'askVolume': undefined,
             'vwap': undefined,
-            'open': parseFloat (ticker['open']),
+            'open': this.safeFloat (ticker, 'open'),
             'close': close,
             'last': close,
             'previousClose': undefined,
             'change': undefined,
             'percentage': undefined,
             'average': undefined,
-            'baseVolume': parseFloat (ticker['longVolume']),
-            'quoteVolume': parseFloat (ticker['shortVolume']),
+            'baseVolume': this.safeFloat (ticker, 'longVolume'),
+            'quoteVolume': this.safeFloat (ticker, 'shortVolume'),
             'info': ticker,
         };
     }
@@ -206,13 +208,14 @@ module.exports = class virwox extends Exchange {
 
     async fetchTrades (symbol, since = undefined, limit = undefined, params = {}) {
         await this.loadMarkets ();
+        let market = this.market (symbol);
         let response = await this.publicGetGetRawTradeData (this.extend ({
             'instrument': symbol,
             'timespan': 3600,
         }, params));
         let result = response['result'];
         let trades = result['data'];
-        return this.parseTrades (trades, symbol);
+        return this.parseTrades (trades, market);
     }
 
     async createOrder (symbol, type, side, amount, price = undefined, params = {}) {

@@ -14,8 +14,9 @@ except NameError:
 import math
 import json
 from ccxt.base.errors import ExchangeError
-from ccxt.base.errors import NotSupported
 from ccxt.base.errors import AuthenticationError
+from ccxt.base.errors import PermissionDenied
+from ccxt.base.errors import NotSupported
 
 
 class bitstamp (Exchange):
@@ -24,7 +25,7 @@ class bitstamp (Exchange):
         return self.deep_extend(super(bitstamp, self).describe(), {
             'id': 'bitstamp',
             'name': 'Bitstamp',
-            'countries': 'GB',
+            'countries': ['GB'],
             'rateLimit': 1000,
             'version': 'v2',
             'has': {
@@ -80,6 +81,7 @@ class bitstamp (Exchange):
                         'xrp_address/',
                         'transfer-to-main/',
                         'transfer-from-main/',
+                        'withdrawal-requests/',
                         'withdrawal/open/',
                         'withdrawal/status/',
                         'withdrawal/cancel/',
@@ -153,6 +155,9 @@ class bitstamp (Exchange):
                     },
                 },
             },
+            'exceptions': {
+                'No permission found': PermissionDenied,
+            },
         })
 
     def fetch_markets(self):
@@ -218,22 +223,25 @@ class bitstamp (Exchange):
             'pair': self.market_id(symbol),
         }, params))
         timestamp = int(ticker['timestamp']) * 1000
-        vwap = float(ticker['vwap'])
-        baseVolume = float(ticker['volume'])
+        vwap = self.safe_float(ticker, 'vwap')
+        baseVolume = self.safe_float(ticker, 'volume')
         quoteVolume = baseVolume * vwap
+        last = self.safe_float(ticker, 'last')
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
-            'high': float(ticker['high']),
-            'low': float(ticker['low']),
-            'bid': float(ticker['bid']),
-            'ask': float(ticker['ask']),
+            'high': self.safe_float(ticker, 'high'),
+            'low': self.safe_float(ticker, 'low'),
+            'bid': self.safe_float(ticker, 'bid'),
+            'bidVolume': None,
+            'ask': self.safe_float(ticker, 'ask'),
+            'askVolume': None,
             'vwap': vwap,
-            'open': float(ticker['open']),
-            'close': None,
-            'first': None,
-            'last': float(ticker['last']),
+            'open': self.safe_float(ticker, 'open'),
+            'close': last,
+            'last': last,
+            'previousClose': None,
             'change': None,
             'percentage': None,
             'average': None,
@@ -250,9 +258,12 @@ class bitstamp (Exchange):
             'tid',
             'type',
             'order_id',
+            'side',
         ])
         currencyIds = list(trade.keys())
         numCurrencyIds = len(currencyIds)
+        if numCurrencyIds > 2:
+            raise ExchangeError(self.id + ' getMarketFromTrade too many keys: ' + self.json(currencyIds) + ' in the trade: ' + self.json(trade))
         if numCurrencyIds == 2:
             marketId = currencyIds[0] + currencyIds[1]
             if marketId in self.markets_by_id:
@@ -336,7 +347,7 @@ class bitstamp (Exchange):
         market = self.market(symbol)
         response = self.publicGetTransactionsPair(self.extend({
             'pair': market['id'],
-            'time': 'minute',
+            'time': 'hour',
         }, params))
         return self.parse_trades(response, market, since, limit)
 
@@ -366,12 +377,12 @@ class bitstamp (Exchange):
         method = 'privatePost' + self.capitalize(side)
         order = {
             'pair': self.market_id(symbol),
-            'amount': amount,
+            'amount': self.amount_to_precision(symbol, amount),
         }
         if type == 'market':
             method += 'Market'
         else:
-            order['price'] = price
+            order['price'] = self.price_to_precision(symbol, price)
         method += 'Pair'
         response = getattr(self, method)(self.extend(order, params))
         return {
@@ -412,6 +423,8 @@ class bitstamp (Exchange):
             market = self.market(symbol)
             request['pair'] = market['id']
             method += 'Pair'
+        if limit is not None:
+            request['limit'] = limit
         response = getattr(self, method)(self.extend(request, params))
         return self.parse_trades(response, market, since, limit)
 
@@ -484,6 +497,7 @@ class bitstamp (Exchange):
             'id': id,
             'datetime': iso8601,
             'timestamp': timestamp,
+            'lastTradeTimestamp': None,
             'status': status,
             'symbol': symbol,
             'type': None,
@@ -500,8 +514,8 @@ class bitstamp (Exchange):
 
     def fetch_open_orders(self, symbol=None, since=None, limit=None, params={}):
         market = None
+        self.load_markets()
         if symbol is not None:
-            self.load_markets()
             market = self.market(symbol)
         orders = self.privatePostOpenOrdersAll()
         return self.parse_orders(orders, market, since, limit)
@@ -528,15 +542,18 @@ class bitstamp (Exchange):
         method += 'Deposit' if v1 else ''
         method += 'Address'
         response = getattr(self, method)(params)
+        address = response if v1 else self.safe_string(response, 'address')
+        tag = None if v1 else self.safe_string(response, 'destination_tag')
+        self.check_address(address)
         return {
             'currency': code,
-            'status': 'ok',
-            'address': self.safe_string(response, 'address'),
-            'tag': self.safe_string(response, 'destination_tag'),
+            'address': address,
+            'tag': tag,
             'info': response,
         }
 
     def withdraw(self, code, amount, address, tag=None, params={}):
+        self.check_address(address)
         if self.is_fiat(code):
             raise NotSupported(self.id + ' fiat withdraw() for ' + code + ' is not implemented yet')
         name = self.get_currency_name(code)
@@ -592,10 +609,15 @@ class bitstamp (Exchange):
             return  # fallback to default error handler
         if (body[0] == '{') or (body[0] == '['):
             response = json.loads(body)
+            # fetchDepositAddress returns {"error": "No permission found"} on apiKeys that don't have the permission required
+            error = self.safe_string(response, 'error')
+            exceptions = self.exceptions
+            if error in exceptions:
+                raise exceptions[error](self.id + ' ' + body)
             status = self.safe_string(response, 'status')
             if status == 'error':
                 code = self.safe_string(response, 'code')
                 if code is not None:
                     if code == 'API0005':
                         raise AuthenticationError(self.id + ' invalid signature, use the uid for the main account if you have subaccounts')
-                raise ExchangeError(self.id + ' ' + self.json(response))
+                raise ExchangeError(self.id + ' ' + body)
